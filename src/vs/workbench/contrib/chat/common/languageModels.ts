@@ -32,6 +32,7 @@ import { asJson, IRequestService } from '../../../../platform/request/common/req
 import { IQuickInputService, IQuickPickItem, QuickInputHideReason } from '../../../../platform/quickinput/common/quickInput.js';
 import { ISecretStorageService } from '../../../../platform/secrets/common/secrets.js';
 import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
+import { IConfigurationResolverService } from '../../../services/configurationResolver/common/configurationResolver.js';
 import { IExtensionService } from '../../../services/extensions/common/extensions.js';
 import { ExtensionsRegistry } from '../../../services/extensions/common/extensionsRegistry.js';
 import { ChatContextKeys } from './actions/chatContextKeys.js';
@@ -758,6 +759,7 @@ export class LanguageModelsService implements ILanguageModelsService {
 		@ILanguageModelsConfigurationService private readonly _languageModelsConfigurationService: ILanguageModelsConfigurationService,
 		@IQuickInputService private readonly _quickInputService: IQuickInputService,
 		@ISecretStorageService private readonly _secretStorageService: ISecretStorageService,
+		@IConfigurationResolverService private readonly _configurationResolverService: IConfigurationResolverService,
 		@IProductService private readonly _productService: IProductService,
 		@IRequestService private readonly _requestService: IRequestService,
 	) {
@@ -1842,7 +1844,8 @@ export class LanguageModelsService implements ILanguageModelsService {
 	}
 
 	private decodeSecretKey(secretInput: unknown): string | undefined {
-		if (!isString(secretInput)) {
+		const secretInputPrefix = '${input:' + LanguageModelsService.SECRET_KEY_PREFIX;
+		if (!isString(secretInput) || !secretInput.startsWith(secretInputPrefix) || !secretInput.endsWith('}')) {
 			return undefined;
 		}
 		return secretInput.substring(secretInput.indexOf(':') + 1, secretInput.length - 1);
@@ -1880,12 +1883,14 @@ export class LanguageModelsService implements ILanguageModelsService {
 			let value = group[key];
 			if (schema.properties?.[key]?.secret) {
 				const secretKey = this.decodeSecretKey(value);
-				value = secretKey ? await this._secretStorageService.get(secretKey) : undefined;
+				if (secretKey) {
+					value = await this._secretStorageService.get(secretKey);
+				}
 			}
 			result[key] = value;
 		}
 
-		return result;
+		return this._configurationResolverService.resolveAsync(undefined, result);
 	}
 
 	private async _resolveLanguageModelProviderGroup(name: string, vendor: string, configuration: IStringDictionary<unknown> | undefined, schema: IJSONSchema | undefined): Promise<ILanguageModelsProviderGroup> {

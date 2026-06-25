@@ -23,6 +23,34 @@ import { IInputBox, IQuickInputHideEvent, IQuickInputService, QuickInputHideReas
 import { TestSecretStorageService } from '../../../../../platform/secrets/test/common/testSecretStorageService.js';
 import { IProductService } from '../../../../../platform/product/common/productService.js';
 import { IRequestService } from '../../../../../platform/request/common/request.js';
+import { IConfigurationResolverService } from '../../../../services/configurationResolver/common/configurationResolver.js';
+
+function resolveConfigurationVariables(value: unknown, environment: Record<string, string>): unknown {
+	if (typeof value === 'string') {
+		return value.replace(/\$\{env:([^}]+)\}/g, (_, variable: string) => environment[variable] ?? '');
+	}
+	if (Array.isArray(value)) {
+		return value.map(item => resolveConfigurationVariables(item, environment));
+	}
+	if (value && typeof value === 'object') {
+		const result: { [key: string]: unknown } = {};
+		for (const key of Object.keys(value)) {
+			result[key] = resolveConfigurationVariables((value as { [key: string]: unknown })[key], environment);
+		}
+		return result;
+	}
+	return value;
+}
+
+function createTestConfigurationResolverService(environment: Record<string, string> = {}): IConfigurationResolverService {
+	return new class extends mock<IConfigurationResolverService>() {
+		override readonly resolvableVariables = new Set(['env']);
+
+		override async resolveAsync(_folder: any, config: any): Promise<any> {
+			return resolveConfigurationVariables(config, environment);
+		}
+	};
+}
 
 suite('LanguageModels', function () {
 
@@ -51,6 +79,7 @@ suite('LanguageModels', function () {
 			},
 			new class extends mock<IQuickInputService>() { },
 			new TestSecretStorageService(),
+			createTestConfigurationResolverService(),
 			new class extends mock<IProductService>() { override readonly version = '1.100.0'; },
 			new class extends mock<IRequestService>() { },
 		);
@@ -432,6 +461,7 @@ suite('LanguageModels - When Clause', function () {
 			},
 			new class extends mock<IQuickInputService>() { },
 			new TestSecretStorageService(),
+			createTestConfigurationResolverService(),
 			new class extends mock<IProductService>() { override readonly version = '1.100.0'; },
 			new class extends mock<IRequestService>() { },
 		);
@@ -495,6 +525,7 @@ suite('LanguageModels - Model Change Events', function () {
 			},
 			new class extends mock<IQuickInputService>() { },
 			new TestSecretStorageService(),
+			createTestConfigurationResolverService(),
 			new class extends mock<IProductService>() { override readonly version = '1.100.0'; },
 			new class extends mock<IRequestService>() { },
 		);
@@ -839,6 +870,7 @@ suite('LanguageModels - Vendor Change Events', function () {
 			},
 			new class extends mock<IQuickInputService>() { },
 			new TestSecretStorageService(),
+			createTestConfigurationResolverService(),
 			new class extends mock<IProductService>() { override readonly version = '1.100.0'; },
 			new class extends mock<IRequestService>() { },
 		);
@@ -961,6 +993,7 @@ suite('LanguageModels - Per-Model Configuration', function () {
 			},
 			new class extends mock<IQuickInputService>() { },
 			new TestSecretStorageService(),
+			createTestConfigurationResolverService(),
 			new class extends mock<IProductService>() { override readonly version = '1.100.0'; },
 			new class extends mock<IRequestService>() { },
 		);
@@ -1076,6 +1109,130 @@ suite('LanguageModels - Per-Model Configuration', function () {
 	});
 });
 
+suite('LanguageModels - Provider Group Configuration Resolution', function () {
+
+	const disposables = new DisposableStore();
+
+	teardown(function () {
+		disposables.clear();
+	});
+
+	ensureNoDisposablesAreLeakedInTestSuite();
+
+	const configurationSchema: ILanguageModelConfigurationSchema = {
+		type: 'object',
+		properties: {
+			apiKey: { type: 'string', secret: true },
+			requestHeaders: { type: 'object' }
+		}
+	};
+
+	async function resolveProviderConfiguration(group: ILanguageModelsProviderGroup, secretStorageService: TestSecretStorageService, environment: Record<string, string> = {}): Promise<{ [name: string]: unknown }> {
+		let resolvedConfiguration: { [name: string]: unknown } | undefined;
+		const languageModelsService = disposables.add(new LanguageModelsService(
+			new class extends mock<IExtensionService>() {
+				override activateByEvent() {
+					return Promise.resolve();
+				}
+			},
+			new NullLogService(),
+			disposables.add(new TestStorageService()),
+			new MockContextKeyService(),
+			new class extends mock<ILanguageModelsConfigurationService>() {
+				override onDidChangeLanguageModelGroups = Event.None;
+				override getLanguageModelsProviderGroups() {
+					return [group];
+				}
+			},
+			new class extends mock<IQuickInputService>() { },
+			secretStorageService,
+			createTestConfigurationResolverService(environment),
+			new class extends mock<IProductService>() { override readonly version = '1.100.0'; },
+			new class extends mock<IRequestService>() { },
+		));
+
+		languageModelsService.deltaLanguageModelChatProviderDescriptors([
+			// Cast needed: TypeFromJsonSchema resolves the `anyOf`+`$ref` configuration
+			// field to `undefined`, but this test needs the runtime schema so the
+			// service resolves provider groups.
+			{ vendor: group.vendor, displayName: 'Config Vendor', configuration: configurationSchema as unknown as undefined, managementCommand: undefined, when: undefined }
+		], []);
+
+		disposables.add(languageModelsService.registerLanguageModelProvider(group.vendor, {
+			onDidChange: Event.None,
+			provideLanguageModelChatInfo: async (options) => {
+				if (!options.group) {
+					return [];
+				}
+				resolvedConfiguration = options.configuration;
+				return [{
+					metadata: {
+						extension: nullExtensionDescription.identifier,
+						name: 'Configured Model',
+						vendor: group.vendor,
+						family: 'configured',
+						version: '1.0',
+						id: 'configured-model',
+						maxInputTokens: 100,
+						maxOutputTokens: 100,
+						isDefaultForLocation: {}
+					} satisfies ILanguageModelChatMetadata,
+					identifier: `${group.vendor}/${options.group}/configured-model`
+				}];
+			},
+			sendChatRequest: async () => { throw new Error(); },
+			provideTokenCount: async () => { throw new Error(); }
+		}));
+
+		await languageModelsService.selectLanguageModels({ vendor: group.vendor });
+		assert.ok(resolvedConfiguration);
+		return resolvedConfiguration;
+	}
+
+	test('resolves secret inputs from secret storage', async function () {
+		const secretStorageService = disposables.add(new TestSecretStorageService());
+		await secretStorageService.set('chat.lm.secret.existing', 'stored-api-key');
+
+		const configuration = await resolveProviderConfiguration({
+			vendor: 'secret-vendor',
+			name: 'default',
+			apiKey: '${input:chat.lm.secret.existing}'
+		}, secretStorageService);
+
+		assert.strictEqual(configuration.apiKey, 'stored-api-key');
+	});
+
+	test('keeps plaintext secret values when they are not encoded secret inputs', async function () {
+		const configuration = await resolveProviderConfiguration({
+			vendor: 'plaintext-vendor',
+			name: 'default',
+			apiKey: 'sk-plaintext'
+		}, disposables.add(new TestSecretStorageService()));
+
+		assert.strictEqual(configuration.apiKey, 'sk-plaintext');
+	});
+
+	test('resolves environment variables in secret values and nested request headers', async function () {
+		const configuration = await resolveProviderConfiguration({
+			vendor: 'env-vendor',
+			name: 'default',
+			apiKey: '${env:LM_API_KEY}',
+			requestHeaders: {
+				Authorization: 'Bearer ${env:LM_API_KEY}',
+				'X-Static': 'value'
+			}
+		}, disposables.add(new TestSecretStorageService()), { LM_API_KEY: 'env-api-key' });
+
+		assert.deepStrictEqual(configuration, {
+			apiKey: 'env-api-key',
+			requestHeaders: {
+				Authorization: 'Bearer env-api-key',
+				'X-Static': 'value'
+			}
+		});
+	});
+});
+
 suite('LanguageModels - Provider Group Management', function () {
 
 	class TestInputBox extends mock<IInputBox>() {
@@ -1121,7 +1278,7 @@ suite('LanguageModels - Provider Group Management', function () {
 		providerGroups = [{
 			vendor: 'custom-vendor',
 			name: 'Custom Group',
-			apiKey: '${input:existing-secret}',
+			apiKey: '${input:chat.lm.secret.existing-secret}',
 			settings: { model: { temperature: 0.7 } }
 		}];
 		updateCalls = [];
@@ -1162,6 +1319,7 @@ suite('LanguageModels - Provider Group Management', function () {
 				}
 			},
 			secretStorageService,
+			createTestConfigurationResolverService(),
 			new class extends mock<IProductService>() { override readonly version = '1.100.0'; },
 			new class extends mock<IRequestService>() { },
 		);
@@ -1206,13 +1364,13 @@ suite('LanguageModels - Provider Group Management', function () {
 			from: {
 				vendor: 'custom-vendor',
 				name: 'Custom Group',
-				apiKey: '${input:existing-secret}',
+				apiKey: '${input:chat.lm.secret.existing-secret}',
 				settings: { model: { temperature: 0.7 } }
 			},
 			to: {
 				vendor: 'custom-vendor',
 				name: 'Renamed Group',
-				apiKey: '${input:existing-secret}',
+				apiKey: '${input:chat.lm.secret.existing-secret}',
 				settings: { model: { temperature: 0.7 } }
 			}
 		}]);
@@ -1220,7 +1378,7 @@ suite('LanguageModels - Provider Group Management', function () {
 
 	test('updateLanguageModelsProviderGroupApiKey stores the new secret and preserves model settings', async function () {
 		acceptedInputValues.push('new-api-key');
-		await secretStorageService.set('existing-secret', 'old-api-key');
+		await secretStorageService.set('chat.lm.secret.existing-secret', 'old-api-key');
 
 		await languageModelsService.updateLanguageModelsProviderGroupApiKey('custom-vendor', 'Custom Group');
 
@@ -1230,7 +1388,7 @@ suite('LanguageModels - Provider Group Management', function () {
 		assert.deepStrictEqual({
 			encodedApiKeyUsesSecretStorage: encodedApiKey.startsWith('${input:chat.lm.secret.'),
 			newSecretValue: await secretStorageService.get(secretKey),
-			oldSecretValue: await secretStorageService.get('existing-secret'),
+			oldSecretValue: await secretStorageService.get('chat.lm.secret.existing-secret'),
 			settings: updatedGroup?.settings,
 			identity: { name: updatedGroup?.name, vendor: updatedGroup?.vendor }
 		}, {
@@ -1244,17 +1402,17 @@ suite('LanguageModels - Provider Group Management', function () {
 
 	test('updateLanguageModelsProviderGroupApiKey leaves the existing secret unchanged when the value is unchanged', async function () {
 		acceptedInputValues.push('old-api-key');
-		await secretStorageService.set('existing-secret', 'old-api-key');
+		await secretStorageService.set('chat.lm.secret.existing-secret', 'old-api-key');
 
 		await languageModelsService.updateLanguageModelsProviderGroupApiKey('custom-vendor', 'Custom Group');
 
 		assert.deepStrictEqual({
 			updateCalls,
 			secretKeys: await secretStorageService.keys(),
-			secretValue: await secretStorageService.get('existing-secret')
+			secretValue: await secretStorageService.get('chat.lm.secret.existing-secret')
 		}, {
 			updateCalls: [],
-			secretKeys: ['existing-secret'],
+			secretKeys: ['chat.lm.secret.existing-secret'],
 			secretValue: 'old-api-key'
 		});
 	});
@@ -1325,6 +1483,7 @@ suite('LanguageModels - Provider Group Detail Fallback', function () {
 			},
 			new class extends mock<IQuickInputService>() { },
 			new TestSecretStorageService(),
+			createTestConfigurationResolverService(),
 			new class extends mock<IProductService>() { override readonly version = '1.100.0'; },
 			new class extends mock<IRequestService>() { },
 		));
@@ -1397,6 +1556,7 @@ suite('LanguageModels - Provider Group Detail Fallback', function () {
 			},
 			new class extends mock<IQuickInputService>() { },
 			new TestSecretStorageService(),
+			createTestConfigurationResolverService(),
 			new class extends mock<IProductService>() { override readonly version = '1.100.0'; },
 			new class extends mock<IRequestService>() { },
 		));
@@ -1458,6 +1618,7 @@ suite('LanguageModels - Provider Group Detail Fallback', function () {
 			},
 			new class extends mock<IQuickInputService>() { },
 			new TestSecretStorageService(),
+			createTestConfigurationResolverService(),
 			new class extends mock<IProductService>() { override readonly version = '1.100.0'; },
 			new class extends mock<IRequestService>() { },
 		));
@@ -1577,4 +1738,3 @@ suite('createModelConfigurationActions', function () {
 		assert.deepStrictEqual(calls, [{ key: 'thinkingEffort', value: 'high' }]);
 	});
 });
-
